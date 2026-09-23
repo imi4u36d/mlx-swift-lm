@@ -100,6 +100,16 @@ public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
 }
 
+/// Target capability for hybrid models whose recurrent layers can report what
+/// they consumed during a speculative verification pass.
+///
+/// A gated-delta state cannot be trimmed like attention K/V. A conforming
+/// target runs the verification pass without committing recurrent state, puts
+/// one ``GatedDeltaCapture`` per recurrent cache in
+/// ``mtpRecurrentCapturesKey``, and lets the iterator replay the accepted
+/// prefix before committing.
+public protocol MTPRecurrentStateCapturingModel: LanguageModel {}
+
 /// Per-stream state for MTP drafters that need their own transient storage.
 ///
 /// The state is intentionally separate from ``LMOutput/State``: `LMOutput`
@@ -302,6 +312,19 @@ public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 /// state after the always-committed bonus token without replaying the model.
 public let mtpCacheCheckpointIndexKey =
     LMOutput.Key<Int>("mtp.cacheCheckpointIndex")
+
+/// The MTP iterator sets this key when a target conforming to
+/// ``MTPRecurrentStateCapturingModel`` must run without committing recurrent
+/// state and report one ``GatedDeltaCapture`` per recurrent layer.
+public let mtpCaptureRecurrentStateKey =
+    LMOutput.Key<Bool>("mtp.captureRecurrentState")
+
+/// Captures emitted for a verification pass, in target cache order.
+///
+/// This is transient iterator state: the iterator consumes it after acceptance
+/// and clears it before the state can be persisted by a prompt-cache save.
+public let mtpRecurrentCapturesKey =
+    LMOutput.Key<[GatedDeltaCapture]>("mtp.recurrentCaptures")
 
 /// Which cache entry each ``mtpSharedKVStatesKey`` tuple was read from, keyed the same way.
 ///

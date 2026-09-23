@@ -81,6 +81,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// coherent drafts → lower acceptance, especially at higher blockSize.
     private var lastRoundAccepted: Int? = nil
 
+    /// Recurrent captures from the most recently committed verification round.
+    /// Early finalization replays them to remove only the unread lookahead.
+    private var lastCapturedRound: [GatedDeltaCapture] = []
+    private var lastCapturedRoundTokenCount = 0
+
     public var promptPrefillTime: TimeInterval = 0.0
     private var telemetry = SpeculativeDecodingTelemetry()
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
@@ -145,16 +150,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         // Probe by opening a round at the width rounds will actually use and discarding it,
         // rather than duplicating the leaf classification as a predicate that could drift from
-        // it. Qwen's hybrid cache is the one typed exception: its target advertises a bounded
-        // recurrent checkpoint and performs the round in place.
+        // it. Qwen's hybrid cache has two typed exceptions: a bounded recurrent checkpoint for
+        // block 2, and capture/replay for deeper blocks.
         let nativeRewindDepth =
             (mainModel as? any SpeculativeCacheRewindModel)?
             .maximumNativeTargetCacheRewind ?? 0
-        let usesNativeHybridRewind =
-            nativeRewindDepth >= effectiveBlockSize - 1
+        let usesCapturedHybridVerify =
+            mainModel is any MTPRecurrentStateCapturingModel
             && mainCache.contains { $0 is MambaCache }
             && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
-        if !usesNativeHybridRewind {
+        let usesNativeHybridRewind =
+            !usesCapturedHybridVerify
+            && nativeRewindDepth >= effectiveBlockSize - 1
+            && mainCache.contains { $0 is MambaCache }
+            && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
+        if !usesCapturedHybridVerify, !usesNativeHybridRewind {
             guard
                 let probe = self.mainCacheStorage.beginRound(
                     maximumPositions: effectiveBlockSize)
@@ -365,6 +375,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // A prior all-accepted round may keep one recurrent checkpoint until
         // its pending output is drained so early finalization can rewind it.
         discardSpeculativePromptCacheCheckpoints(mainCache)
+        lastCapturedRound = []
+        lastCapturedRoundTokenCount = 0
 
         // A speculative round can emit up to `numDraft + 1` tokens: the
         // accepted draft prefix plus the verifier's correction/bonus token.
@@ -399,19 +411,25 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         // Attention-only targets verify through a staged round. Qwen's hybrid target instead
-        // checkpoints its recurrent entries and rewinds them in place; the typed capability and
-        // cache topology keep that exception fail-closed.
+        // captures its recurrent entries and replays the accepted prefix; block 2 can also use
+        // the older single-checkpoint path. The typed capability and cache topology keep these
+        // exceptions fail-closed.
         let nativeRewindDepth =
             (mainModel as? any SpeculativeCacheRewindModel)?
             .maximumNativeTargetCacheRewind ?? 0
+        let capturedHybridVerify =
+            mainModel is any MTPRecurrentStateCapturingModel
+            && mainCache.contains { $0 is MambaCache }
+            && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
         let nativeHybridRewind =
-            nativeRewindDepth >= numDraft
+            !capturedHybridVerify
+            && nativeRewindDepth >= numDraft
             && mainCache.contains { $0 is MambaCache }
             && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
         let round =
-            nativeHybridRewind
+            nativeHybridRewind || capturedHybridVerify
             ? nil : mainCacheStorage.beginRound(maximumPositions: numDraft + 1)
-        guard nativeHybridRewind || round != nil else {
+        guard nativeHybridRewind || capturedHybridVerify || round != nil else {
             switchToPassthrough(
                 reason: "main KV cache cannot stage a speculative round; continuing without "
                     + "speculation")
@@ -492,10 +510,19 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
         verifyState[mtpCacheCheckpointIndexKey] = nativeHybridRewind ? 1 : nil
-        let verifyCache = nativeHybridRewind ? mainCache : round!.caches
+        verifyState[mtpCaptureRecurrentStateKey] = capturedHybridVerify ? true : nil
+        let verifyCache =
+            nativeHybridRewind || capturedHybridVerify ? mainCache : round!.caches
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: verifyCache, state: verifyState)
         let mainLogits = mainResult.logits
+        let recurrentCaptures =
+            capturedHybridVerify
+            ? mainResult.state?[mtpRecurrentCapturesKey] : nil
+        if capturedHybridVerify, recurrentCaptures == nil {
+            preconditionFailure(
+                "MTP capture target did not emit recurrent captures for a verification pass")
+        }
         mainState = mainResult.state
 
         eval(flatDraftTokens)
@@ -559,7 +586,33 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         let rejected = numDraft - accepted
         let snapshotPlaced: Bool
-        if nativeHybridRewind {
+        if capturedHybridVerify {
+            guard let recurrentCaptures else {
+                preconditionFailure("missing recurrent captures after verification")
+            }
+            let trimmed = trimAttentionCaches(mainCache, numTokens: rejected)
+            precondition(
+                trimmed == rejected,
+                "Captured hybrid verification trimmed \(trimmed) of \(rejected) attention rows")
+            guard
+                commitCapturedRecurrentState(
+                    recurrentCaptures,
+                    validCount: accepted + 1)
+            else {
+                switchToPassthrough(
+                    reason: "target recurrent captures did not match its cache topology")
+                mainState = nil
+                y = .init(tokens: emittedFinalToken)
+                return
+            }
+            mainCacheStorage.commitProcessedTokens(accepted + 1)
+            lastCapturedRound = recurrentCaptures
+            lastCapturedRoundTokenCount = accepted + 1
+            snapshotPlaced = reconcileSharedKVState(
+                &mainState, discarding: rejected,
+                lengths: mainCacheStorage.emittedLength(forLeaf:))
+            mainState?[mtpRecurrentCapturesKey] = nil
+        } else if nativeHybridRewind {
             if rejected == 0 {
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
             } else {
@@ -600,6 +653,34 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         y = .init(tokens: emittedFinalToken)
     }
 
+    /// Trim every append-only attention leaf by the rejected tail. Recurrent
+    /// leaves are committed separately from their replay captures.
+    private func trimAttentionCaches(_ cache: [KVCache], numTokens: Int) -> Int {
+        guard numTokens >= 0 else { return 0 }
+        guard numTokens > 0 else { return 0 }
+        for entry in cache where entry.isTrimmable {
+            guard entry.trim(numTokens) == numTokens else { return 0 }
+        }
+        return numTokens
+    }
+
+    /// Assign each recurrent cache the state represented by the first
+    /// `validCount` positions of the last verification pass.
+    private func commitCapturedRecurrentState(
+        _ captures: [GatedDeltaCapture],
+        validCount: Int
+    ) -> Bool {
+        let recurrentCaches = mainCache.compactMap { $0 as? MambaCache }
+        guard recurrentCaches.count == captures.count else { return false }
+        let count = MLXArray(Int32(validCount))
+        for (cache, capture) in zip(recurrentCaches, captures) {
+            let replayed = capture.replay(validCount: count)
+            cache[0] = replayed.conv
+            cache[1] = replayed.recurrent
+        }
+        return true
+    }
+
     /// Switch to single-token generation for the remainder of the stream.
     /// Sticky — once flipped, `next()` never returns to speculation.
     private mutating func switchToPassthrough(reason: String) {
@@ -620,6 +701,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainState?[mtpSharedKVSourceIndicesKey] = nil
         mainState?[mtpSharedKVOffsetsKey] = nil
         mainState?[mtpPositionDeltasKey] = nil
+        mainState?[mtpRecurrentCapturesKey] = nil
+        mainState?[mtpCaptureRecurrentStateKey] = nil
+        lastCapturedRound = []
+        lastCapturedRoundTokenCount = 0
     }
 
     /// One single-token forward step against the main model, used in
@@ -702,6 +787,23 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
         let consumed = Swift.min(pendingIndex, committedPendingTokenCount)
         let lookahead = committedPendingTokenCount - consumed
         guard lookahead > 0 else { return }
+
+        if !lastCapturedRound.isEmpty {
+            let retained = lastCapturedRoundTokenCount - lookahead
+            guard retained > 0 else { return }
+            let trimmed = trimAttentionCaches(mainCache, numTokens: lookahead)
+            guard trimmed == lookahead else { return }
+            guard commitCapturedRecurrentState(lastCapturedRound, validCount: retained) else {
+                return
+            }
+            mainCacheStorage.noteExternalRewind(lookahead)
+            reconcileSharedKVState(
+                &mainState, discarding: lookahead,
+                lengths: mainCacheStorage.emittedLength(forLeaf:))
+            lastCapturedRound = []
+            lastCapturedRoundTokenCount = 0
+            return
+        }
 
         let usesNativeHybridRewind =
             ((mainModel as? any SpeculativeCacheRewindModel)?

@@ -705,6 +705,77 @@ public enum Qwen35Language {
             let gated = norm(out, gate: z)
             return outProj(gated.reshaped(B, S, -1))
         }
+
+        func zeroStates(batch: Int, dtype: DType) -> (conv: MLXArray, rec: MLXArray) {
+            (
+                MLXArray.zeros(
+                    [batch, max(0, convKernelSize - 1), convDim], dtype: dtype),
+                MLXArray.zeros(
+                    [batch, numVHeads, headVDim, headKDim], dtype: .float32)
+            )
+        }
+
+        /// Verification-pass variant that returns a replay capture instead of
+        /// committing recurrent state.
+        func forwardCapturing(
+            _ inputs: MLXArray,
+            mask: MLXArray?,
+            convState: MLXArray,
+            recState: MLXArray?
+        ) -> (output: MLXArray, convState: MLXArray, capture: GatedDeltaCapture) {
+            let B = inputs.dim(0)
+            let S = inputs.dim(1)
+            var (mixedQKV, z, b, a) = projectInputs(
+                inputs, batch: B, sequence: S)
+            if let mask {
+                mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
+            }
+
+            let convInput = concatenated([convState, mixedQKV], axis: 1)
+            let newConvState = contiguous(
+                convInput[0..., (-(convKernelSize - 1))..., 0...])
+            let convOut = silu(conv1d(convInput))
+            let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = split[0].reshaped(B, S, numKHeads, headKDim)
+            let k = split[1].reshaped(B, S, numKHeads, headKDim)
+            let v = split[2].reshaped(B, S, numVHeads, headVDim)
+
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            let qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let initialState =
+                recState ?? MLXArray.zeros(
+                    [B, numVHeads, headVDim, headKDim], dtype: .float32)
+
+            let (out, _) = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: initialState,
+                mask: mask,
+                useKernel: !training)
+            let capture = GatedDeltaCapture(
+                convInput: convInput,
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                initialState: initialState)
+            let gated = norm(out, gate: z)
+            return (outProj(gated.reshaped(B, S, -1)), newConvState, capture)
+        }
     }
 
     open class SparseMoeBlock: Module, UnaryLayer {
@@ -884,6 +955,59 @@ public enum Qwen35Language {
 
             return applyFinalNorm ? norm(hiddenStates) : hiddenStates
         }
+
+        /// MTP verification pass. Full-attention entries are written normally;
+        /// GDN entries are captured for an exact accepted-prefix replay.
+        func forwardCapturing(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]? = nil,
+            positionIds: MLXArray? = nil
+        ) -> (hiddenStates: MLXArray, captures: [GatedDeltaCapture]) {
+            var hiddenStates = inputsEmbeds ?? embedTokens(inputs)
+            let cacheArray =
+                cache
+                ?? Array(repeating: nil as KVCache?, count: layers.count)
+
+            let faMaskMode = createAttentionMask(
+                h: hiddenStates, cache: cacheArray[faIdx], returnArray: true)
+            let faMask: MLXArray?
+            if case .array(let arrayMask) = faMaskMode {
+                faMask = arrayMask
+            } else {
+                faMask = nil
+            }
+            let ssmMask = createSSMMask(
+                h: hiddenStates, cache: cacheArray[ssmIdx] as? MambaCache)
+
+            var captures = [GatedDeltaCapture]()
+            captures.reserveCapacity(layers.filter(\.isLinear).count)
+            for (index, layer) in layers.enumerated() {
+                if layer.isLinear {
+                    let mamba = cacheArray[index] as? MambaCache
+                    let zero = layer.linearAttn!.zeroStates(
+                        batch: hiddenStates.dim(0), dtype: hiddenStates.dtype)
+                    let result = layer.linearAttn!.forwardCapturing(
+                        layer.inputLayerNorm(hiddenStates),
+                        mask: ssmMask,
+                        convState: mamba?[0] ?? zero.conv,
+                        recState: mamba?[1])
+                    let h = hiddenStates + result.output
+                    hiddenStates =
+                        h + (layer.mlp as! UnaryLayer)(layer.postAttentionLayerNorm(h))
+                    captures.append(result.capture)
+                } else {
+                    hiddenStates = layer(
+                        hiddenStates,
+                        attentionMask: faMask,
+                        ssmMask: nil,
+                        cache: cacheArray[index],
+                        positionIds: positionIds)
+                }
+            }
+
+            return (hiddenStates, captures)
+        }
     }
 
     final class LanguageModel: Module {
@@ -1000,14 +1124,29 @@ public enum Qwen35Language {
             }
 
             let emitDrafterState = state[mtpEmitFlagKey] ?? false
-            let preNormHidden = model(
-                inputs,
-                inputsEmbeds: inputsEmbeds,
-                cache: cache,
-                positionIds: positionIds,
-                applyFinalNorm: !emitDrafterState,
-                checkpointAfter: state[mtpCacheCheckpointIndexKey]
-            )
+            let captureRecurrentState =
+                emitDrafterState && (state[mtpCaptureRecurrentStateKey] ?? false)
+            let captures: [GatedDeltaCapture]
+            let preNormHidden: MLXArray
+            if captureRecurrentState {
+                let result = model.forwardCapturing(
+                    inputs,
+                    inputsEmbeds: inputsEmbeds,
+                    cache: cache,
+                    positionIds: positionIds)
+                preNormHidden = result.hiddenStates
+                captures = result.captures
+            } else {
+                preNormHidden = model(
+                    inputs,
+                    inputsEmbeds: inputsEmbeds,
+                    cache: cache,
+                    positionIds: positionIds,
+                    applyFinalNorm: !emitDrafterState,
+                    checkpointAfter: state[mtpCacheCheckpointIndexKey]
+                )
+                captures = []
+            }
             let hiddenStates = emitDrafterState ? model.norm(preNormHidden) : preNormHidden
 
             var out = hiddenStates
@@ -1025,6 +1164,10 @@ public enum Qwen35Language {
                     cache: cache, fullAttentionIndex: model.faIdx)
                 state[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
                 state[mtpPositionDeltasKey] = state[ropeDeltasKey]
+                if !captures.isEmpty {
+                    state[mtpRecurrentCapturesKey] = captures
+                }
+                state[mtpCaptureRecurrentStateKey] = nil
             }
 
             return LMOutput(logits: out, state: state)
@@ -1487,6 +1630,8 @@ public class Qwen35: Module, VLMModel {
 extension Qwen35: SpeculativeCacheRewindModel {
     public var maximumNativeTargetCacheRewind: Int { 1 }
 }
+
+extension Qwen35: MTPRecurrentStateCapturingModel {}
 
 extension Array where Element == THW {
     fileprivate var nilIfEmpty: [THW]? { isEmpty ? nil : self }

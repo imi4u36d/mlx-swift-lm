@@ -77,7 +77,8 @@ final class Qwen35VLMNextNPredictor: Module {
 
 public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
     public let configuration: Qwen35Configuration.TextConfiguration
-    public let maximumBlockSize: Int? = 2
+    /// One bonus token plus up to three drafts.
+    public let maximumBlockSize: Int? = 4
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
@@ -184,10 +185,36 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         let lmHead = target.languageModel.lmHead
 
         if let seed = state.seedToken {
+            let proposedCount = max(1, blockSize - 1)
             state.seedToken = nil
+            guard proposedCount > 1, let seedHidden = state.seedHidden else {
+                state.seedHidden = nil
+                state.proposalAppended = 0
+                return normalizedMTPColumn(seed)
+            }
+
+            var tokens = [normalizedMTPColumn(seed)]
+            var token = seed
+            var hidden = seedHidden
+            let appended = proposedCount - 1
+            for step in 0 ..< appended {
+                let mtpHidden = mtp(
+                    inputsEmbeds: inputEmbedding(token),
+                    hiddenStates: hidden,
+                    cache: state.cache,
+                    positionOffset: queryOffset + step,
+                    positionDeltas: positionDeltas)
+                hidden = mtpHidden
+                let logits = lmHead.map { $0(mtpHidden) }
+                    ?? targetEmbedTokens.asLinear(mtpHidden)
+                token = normalizedMTPColumn(
+                    sampler.sample(logits: logits[0..., -1, 0...]))
+                tokens.append(token)
+            }
             state.seedHidden = nil
-            state.proposalAppended = 0
-            return seed
+            state.proposalAppended = appended
+            state.nextPosition += appended
+            return concatenated(tokens, axis: 1)
         }
 
         state.proposalAppended = blockSize - 1

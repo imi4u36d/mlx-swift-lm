@@ -207,6 +207,18 @@ package final class KVCacheStorage {
         return rewound
     }
 
+    /// Record a rewind whose cache leaves were already reconciled by the caller.
+    ///
+    /// Captured hybrid verification commits recurrent state by replaying the
+    /// accepted prefix; only attention rows need trimming, so the generic
+    /// all-leaves `rewindSpeculative` cannot express the operation.
+    package func noteExternalRewind(_ count: Int) {
+        precondition(count >= 0, "Rewind count cannot be negative")
+        precondition(count <= processedTokenCount, "Cache rewound beyond its timeline")
+        processedTokenCount -= count
+        lastRound = nil
+    }
+
     /// Open a staged round over these entries, or `nil` when one of them cannot take part.
     ///
     /// Every leaf is classified before anything is constructed, so a refusal leaves the entries

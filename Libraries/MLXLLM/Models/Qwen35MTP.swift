@@ -67,7 +67,13 @@ final class Qwen35MTPPredictor: Module {
 
 public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
     public let configuration: Qwen35TextConfiguration
-    public let maximumBlockSize: Int? = 2
+    /// One bonus token plus up to three drafts.
+    ///
+    /// The head is a single autoregressive predictor, so it can propose more
+    /// than one token by feeding each sampled token back. Four is the deepest
+    /// block this implementation exposes; the target verifier must be able to
+    /// commit any accepted prefix of the round.
+    public let maximumBlockSize: Int? = 4
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
@@ -165,10 +171,35 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
 
         if let seed = state.seedToken {
+            let proposedCount = max(1, blockSize - 1)
             state.seedToken = nil
+            guard proposedCount > 1, let seedHidden = state.seedHidden else {
+                state.seedHidden = nil
+                state.proposalAppended = 0
+                return normalizedMTPColumn(seed)
+            }
+
+            var tokens = [normalizedMTPColumn(seed)]
+            var token = seed
+            var hidden = seedHidden
+            let appended = proposedCount - 1
+            for step in 0 ..< appended {
+                let mtpHidden = mtp(
+                    inputsEmbeds: inputEmbedding(token),
+                    hiddenStates: hidden,
+                    cache: state.cache,
+                    positionOffset: queryOffset + step)
+                hidden = mtpHidden
+                let logits = lmHead.map { $0(mtpHidden) }
+                    ?? targetEmbedTokens.asLinear(mtpHidden)
+                token = normalizedMTPColumn(
+                    sampler.sample(logits: logits[0..., -1, 0...]))
+                tokens.append(token)
+            }
             state.seedHidden = nil
-            state.proposalAppended = 0
-            return seed
+            state.proposalAppended = appended
+            state.nextPosition += appended
+            return concatenated(tokens, axis: 1)
         }
 
         state.proposalAppended = blockSize - 1
