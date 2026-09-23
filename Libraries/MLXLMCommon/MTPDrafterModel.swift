@@ -82,6 +82,36 @@ public protocol MTPDrafterModel: BaseLanguageModel {
         blockSize: Int,
         sampler: any LogitSampler
     ) -> MLXArray
+
+    /// Distribution-aware variant used by standard speculative sampling.
+    ///
+    /// The token block and each position's proposal distribution are returned
+    /// together. A conformer that cannot materialize its proposal distribution
+    /// returns `nil`; the iterator then falls back to exact-token acceptance.
+    func draftBlockWithDistributions(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        sampler: any LogitSampler
+    ) -> MTPDraftBlock?
+}
+
+/// One draft block together with the proposal distribution at every position.
+public struct MTPDraftBlock {
+    /// Proposed token IDs, shape `[B, blockSize - 1]`.
+    public let tokens: MLXArray
+    /// Proposal distributions, one `[B, vocabulary]` probability array per
+    /// proposed position.
+    public let distributions: [MLXArray]
+
+    public init(tokens: MLXArray, distributions: [MLXArray]) {
+        self.tokens = tokens
+        self.distributions = distributions
+    }
 }
 
 extension MTPDrafterModel {
@@ -89,6 +119,19 @@ extension MTPDrafterModel {
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
     public var requiresGreedySampling: Bool { false }
+
+    public func draftBlockWithDistributions(
+        target _: any LanguageModel,
+        lastToken _: MLXArray,
+        lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)],
+        positionDeltas _: MLXArray?,
+        queryOffset _: Int,
+        blockSize _: Int,
+        sampler _: any LogitSampler
+    ) -> MTPDraftBlock? {
+        nil
+    }
 }
 
 /// Target-side capability for rewinding an in-place speculative verify pass.
@@ -125,6 +168,8 @@ public struct MTPDrafterState {
     /// round. Qwen uses this to avoid advancing its cache twice.
     public var seedToken: MLXArray?
     public var seedHidden: MLXArray?
+    /// Proposal distribution corresponding to ``seedToken``.
+    public var seedDistribution: MLXArray?
 
     /// Number of tentative cache entries appended by the current proposal.
     public var proposalAppended: Int
@@ -134,12 +179,14 @@ public struct MTPDrafterState {
         nextPosition: Int = 0,
         seedToken: MLXArray? = nil,
         seedHidden: MLXArray? = nil,
+        seedDistribution: MLXArray? = nil,
         proposalAppended: Int = 0
     ) {
         self.cache = cache
         self.nextPosition = nextPosition
         self.seedToken = seedToken
         self.seedHidden = seedHidden
+        self.seedDistribution = seedDistribution
         self.proposalAppended = proposalAppended
     }
 }
@@ -179,6 +226,19 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
         sampler: any LogitSampler
     ) -> MLXArray
 
+    /// Stateful variant of ``MTPDrafterModel/draftBlockWithDistributions(target:lastToken:lastHidden:sharedKV:positionDeltas:queryOffset:blockSize:sampler:)``.
+    func draftBlockWithDistributions(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> MTPDraftBlock?
+
     /// Reconcile tentative proposal writes with the sequence accepted by the
     /// target, then seed the next proposal if the architecture supports it.
     func commitDrafterState(
@@ -194,6 +254,20 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
 }
 
 extension StatefulMTPDrafterModel {
+    public func draftBlockWithDistributions(
+        target _: any LanguageModel,
+        lastToken _: MLXArray,
+        lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)],
+        positionDeltas _: MLXArray?,
+        queryOffset _: Int,
+        blockSize _: Int,
+        state _: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) -> MTPDraftBlock? {
+        nil
+    }
+
     public func prepareDrafterState(
         target _: any LanguageModel,
         promptTokens _: MLXArray,

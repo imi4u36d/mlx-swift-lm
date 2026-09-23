@@ -135,9 +135,11 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             cache: state.cache, positionOffset: 0, positionDeltas: nil)
         state.nextPosition = shifted.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = sampleMTPSeedWithDistribution(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: target.languageModel.lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedDistribution = seed.distribution
         state.proposalAppended = 0
     }
 
@@ -187,6 +189,7 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         if let seed = state.seedToken {
             let proposedCount = max(1, blockSize - 1)
             state.seedToken = nil
+            state.seedDistribution = nil
             guard proposedCount > 1, let seedHidden = state.seedHidden else {
                 state.seedHidden = nil
                 state.proposalAppended = 0
@@ -240,6 +243,102 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         return proposed
     }
 
+    public func draftBlockWithDistributions(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> MTPDraftBlock? {
+        guard let distributionSampler = sampler as? any DistributionSampler else {
+            return nil
+        }
+        guard let target = target as? Qwen35 else {
+            fatalError(
+                "Qwen35VLMNextNDraftModel requires a Qwen35 VLM target, got \(type(of: target))")
+        }
+
+        let targetEmbedTokens = target.languageModel.model.embedTokens
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let lmHead = target.languageModel.lmHead
+
+        if let seed = state.seedToken {
+            guard let seedDistribution = state.seedDistribution else {
+                return nil
+            }
+            let proposedCount = max(1, blockSize - 1)
+            let seedColumn = normalizedMTPColumn(seed)
+            guard proposedCount > 1, let seedHidden = state.seedHidden else {
+                state.seedToken = nil
+                state.seedHidden = nil
+                state.seedDistribution = nil
+                state.proposalAppended = 0
+                return MTPDraftBlock(
+                    tokens: seedColumn,
+                    distributions: [seedDistribution]
+                )
+            }
+
+            var tokens = [seedColumn]
+            var distributions = [seedDistribution]
+            var token = seed
+            var hidden = seedHidden
+            let appended = proposedCount - 1
+            for step in 0 ..< appended {
+                let mtpHidden = mtp(
+                    inputsEmbeds: inputEmbedding(token),
+                    hiddenStates: hidden,
+                    cache: state.cache,
+                    positionOffset: queryOffset + step,
+                    positionDeltas: positionDeltas)
+                hidden = mtpHidden
+                let logits = lmHead.map { $0(mtpHidden) }
+                    ?? targetEmbedTokens.asLinear(mtpHidden)
+                let stepLogits = logits[0..., -1, 0...]
+                token = normalizedMTPColumn(sampler.sample(logits: stepLogits))
+                tokens.append(token)
+                distributions.append(
+                    distributionSampler.probabilities(logits: stepLogits))
+            }
+            state.seedToken = nil
+            state.seedHidden = nil
+            state.seedDistribution = nil
+            state.proposalAppended = appended
+            state.nextPosition += appended
+            return MTPDraftBlock(
+                tokens: concatenated(tokens, axis: 1),
+                distributions: distributions
+            )
+        }
+
+        let proposed = draftMTPTokenBlockWithDistributions(
+            targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead,
+            inputEmbedding: inputEmbedding,
+            lastToken: lastToken,
+            lastHidden: lastHidden,
+            queryOffset: queryOffset,
+            blockSize: blockSize,
+            sampler: sampler,
+            cache: state.cache
+        ) { inputsEmbeds, hiddenStates, cache, positionOffset in
+            mtp(
+                inputsEmbeds: inputsEmbeds,
+                hiddenStates: hiddenStates,
+                cache: cache,
+                positionOffset: positionOffset,
+                positionDeltas: positionDeltas)
+        }
+        guard let proposed else { return nil }
+        state.proposalAppended = blockSize - 1
+        state.nextPosition += state.proposalAppended
+        return proposed
+    }
+
     public func commitDrafterState(
         target: any LanguageModel,
         targetHidden: MLXArray,
@@ -279,9 +378,11 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             positionDeltas: positionDeltas)
         state.nextPosition += committedTokens.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = sampleMTPSeedWithDistribution(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: target.languageModel.lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedDistribution = seed.distribution
         state.proposalAppended = 0
     }
 

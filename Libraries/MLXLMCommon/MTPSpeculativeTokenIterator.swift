@@ -472,10 +472,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         let bonusToken = y.tokens
         let draftTokens: MLXArray
+        let draftDistributions: [MLXArray]
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
         {
-            draftTokens = statefulDrafter.draftBlock(
+            if let block = statefulDrafter.draftBlockWithDistributions(
                 target: mainModel,
                 lastToken: bonusToken,
                 lastHidden: bonusSlotHidden,
@@ -485,10 +486,26 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 blockSize: numDraft + 1,  // total round size: bonus + numDraft
                 state: &currentDrafterState,
                 sampler: sampler
-            )
+            ) {
+                draftTokens = block.tokens
+                draftDistributions = block.distributions
+            } else {
+                draftTokens = statefulDrafter.draftBlock(
+                    target: mainModel,
+                    lastToken: bonusToken,
+                    lastHidden: bonusSlotHidden,
+                    sharedKV: sharedKV,
+                    positionDeltas: state[mtpPositionDeltasKey],
+                    queryOffset: queryOffset,
+                    blockSize: numDraft + 1,  // total round size: bonus + numDraft
+                    state: &currentDrafterState,
+                    sampler: sampler
+                )
+                draftDistributions = []
+            }
             drafterState = currentDrafterState
         } else {
-            draftTokens = drafter.draftBlock(
+            if let block = drafter.draftBlockWithDistributions(
                 target: mainModel,
                 lastToken: bonusToken,
                 lastHidden: bonusSlotHidden,
@@ -497,7 +514,22 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 queryOffset: queryOffset,
                 blockSize: numDraft + 1,  // total round size: bonus + numDraft
                 sampler: sampler
-            )
+            ) {
+                draftTokens = block.tokens
+                draftDistributions = block.distributions
+            } else {
+                draftTokens = drafter.draftBlock(
+                    target: mainModel,
+                    lastToken: bonusToken,
+                    lastHidden: bonusSlotHidden,
+                    sharedKV: sharedKV,
+                    positionDeltas: state[mtpPositionDeltasKey],
+                    queryOffset: queryOffset,
+                    blockSize: numDraft + 1,  // total round size: bonus + numDraft
+                    sampler: sampler
+                )
+                draftDistributions = []
+            }
         }
         // draftTokens shape [B, numDraft] -> flatten to [numDraft].
         let flatDraftTokens = draftTokens.flattened()
@@ -528,25 +560,73 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         eval(flatDraftTokens)
         let draftTokensList = flatDraftTokens.asArray(Int.self)
 
+        let usesStandardVerification =
+            sampler is any DistributionSampler
+            && draftDistributions.count == numDraft
         var accepted = 0
         var finalToken: MLXArray?
-        for i in 0 ..< numDraft {
-            var logits = mainLogits[0..., verifyStart + i, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let targetToken = sampler.sample(logits: logits)
-            eval(targetToken)
-            let targetTokenValue = targetToken.item(Int.self)
-            processor?.didSample(token: targetToken)
-            pendingTokens.append(targetTokenValue)
-            guard targetTokenValue == draftTokensList[i] else {
-                finalToken = targetToken
+        if usesStandardVerification {
+            let distributionSampler = sampler as! any DistributionSampler
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let targetProbabilities = distributionSampler.probabilities(logits: logits)
+                let proposalProbabilities = draftDistributions[i]
+                let draftTokenValue = draftTokensList[i]
+                let pAtDraft = targetProbabilities[0..., draftTokenValue]
+                let qAtDraft = proposalProbabilities[0..., draftTokenValue]
+                let ratio = pAtDraft / maximum(
+                    qAtDraft, MLXArray(Float.leastNonzeroMagnitude))
+                let acceptProbability = MLX.where(
+                    qAtDraft .> 0,
+                    minimum(ratio, MLXArray(1.0)),
+                    MLXArray(0.0)
+                )
+                let uniform = MLXRandom.uniform(
+                    low: 0.0, high: 1.0, acceptProbability.shape)
+                eval(acceptProbability, uniform)
+
+                if uniform.item(Float.self) <= acceptProbability.item(Float.self) {
+                    let draftToken = MLXArray(Int32(draftTokenValue))
+                    processor?.didSample(token: draftToken)
+                    pendingTokens.append(draftTokenValue)
+                    accepted += 1
+                    continue
+                }
+
+                let residual = maximum(
+                    targetProbabilities - proposalProbabilities, MLXArray(0.0))
+                let residualTotal = residual.sum(axis: -1, keepDims: true)
+                let normalizedResidual = residual / maximum(
+                    residualTotal, MLXArray(Float.leastNonzeroMagnitude))
+                let residualLogits = log(maximum(
+                    normalizedResidual, MLXArray(Float.leastNonzeroMagnitude)))
+                let corrected = categorical(residualLogits)
+                eval(corrected)
+                processor?.didSample(token: corrected)
+                pendingTokens.append(corrected.item(Int.self))
+                finalToken = corrected
                 break
             }
-            accepted += 1
+        } else {
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let targetToken = sampler.sample(logits: logits)
+                eval(targetToken)
+                let targetTokenValue = targetToken.item(Int.self)
+                processor?.didSample(token: targetToken)
+                pendingTokens.append(targetTokenValue)
+                guard targetTokenValue == draftTokensList[i] else {
+                    finalToken = targetToken
+                    break
+                }
+                accepted += 1
+            }
         }
 
         // Only the all-accepted path samples the bonus row. On rejection the
-        // mismatching target sample above is already the emitted correction.
+        // correction sampled above is already the emitted token.
         if finalToken == nil {
             var logits = mainLogits[0..., verifyStart + accepted, 0...]
             logits = processor?.process(logits: logits) ?? logits

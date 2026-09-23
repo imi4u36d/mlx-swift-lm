@@ -14,6 +14,18 @@ public protocol LogitSampler {
     func sample(logits: MLXArray) -> MLXArray
 }
 
+/// A sampler that can also materialize the normalized distribution it samples
+/// from.
+///
+/// Speculative decoding needs both sides of the proposal/verification pair as
+/// distributions: the drafter's `q` and the target's `p`. A sampler without
+/// this capability can still be used for ordinary decoding, but speculative
+/// verification has to fall back to exact-token acceptance.
+public protocol DistributionSampler: LogitSampler {
+    /// Return the normalized probability distribution represented by `logits`.
+    func probabilities(logits: MLXArray) -> MLXArray
+}
+
 /// A `LogitProcessor` is an optional visitor of `logits`.
 ///
 /// The ``LogitProcessor`` is called with the input (prompt) before generating tokens:
@@ -328,11 +340,17 @@ public struct GenerateParameters: Sendable {
 }
 
 /// Sampler that uses `argMax` (most likely) to sample the logits.
-public struct ArgMaxSampler: LogitSampler {
+public struct ArgMaxSampler: DistributionSampler {
     public init() {}
 
     public func sample(logits: MLXArray) -> MLXArray {
         argMax(logits, axis: -1)
+    }
+
+    public func probabilities(logits: MLXArray) -> MLXArray {
+        let token = argMax(logits, axis: -1)
+        let vocabulary = MLXArray.arange(logits.dim(-1))
+        return MLX.equal(token[.ellipsis, .newAxis], vocabulary).asType(.float32)
     }
 }
 
@@ -343,7 +361,7 @@ public struct ArgMaxSampler: LogitSampler {
 /// Each filter operates on the full vocabulary in original token order, masking
 /// rejected tokens with `-inf`. This matches the composable filter chain in
 /// `mlx_lm.sample_utils.make_sampler`.
-public struct TopPSampler: LogitSampler {
+public struct TopPSampler: DistributionSampler {
     let temp: MLXArray
     let topP: MLXArray?
     let topK: Int?
@@ -370,27 +388,34 @@ public struct TopPSampler: LogitSampler {
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
+        return withRandomState(randomState) {
+            categorical(filteredLogprobs(logits) * (1 / temp))
+        }
+    }
+
+    public func probabilities(logits: MLXArray) -> MLXArray {
+        softmax(filteredLogprobs(logits) * (1 / temp))
+    }
+
+    private func filteredLogprobs(_ logits: MLXArray) -> MLXArray {
         var logits = logits
         if logits.dtype == .bfloat16 {
             logits = logits.asType(.float32)
         }
 
-        return withRandomState(randomState) {
-            var logprobs = logSoftmax(logits)
+        var logprobs = logSoftmax(logits)
 
-            // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
-            if let topP {
-                logprobs = applyTopP(logprobs, topP: topP)
-            }
-            if let minP {
-                logprobs = applyMinP(logprobs, minP: minP)
-            }
-            if let topK {
-                logprobs = applyTopK(logprobs, topK: topK)
-            }
-
-            return categorical(logprobs * (1 / temp))
+        // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
+        if let topP {
+            logprobs = applyTopP(logprobs, topP: topP)
         }
+        if let minP {
+            logprobs = applyMinP(logprobs, minP: minP)
+        }
+        if let topK {
+            logprobs = applyTopK(logprobs, topK: topK)
+        }
+        return logprobs
     }
 
     /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
@@ -428,7 +453,7 @@ public struct TopPSampler: LogitSampler {
 }
 
 /// Sampler that uses `temperature` to sample the logits.
-public struct CategoricalSampler: LogitSampler {
+public struct CategoricalSampler: DistributionSampler {
     let temp: MLXArray
     let randomState: MLXRandom.RandomState
 
@@ -443,6 +468,10 @@ public struct CategoricalSampler: LogitSampler {
         return withRandomState(randomState) {
             categorical(logits * (1 / temp))
         }
+    }
+
+    public func probabilities(logits: MLXArray) -> MLXArray {
+        softmax(logits.asType(.float32) * (1 / temp))
     }
 }
 

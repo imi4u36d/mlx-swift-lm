@@ -110,6 +110,62 @@ package func draftMTPTokenBlock(
     return concatenated(tokens, axis: 1)
 }
 
+package func draftMTPTokenBlockWithDistributions(
+    targetEmbedTokens: Embedding,
+    lmHead: Linear?,
+    inputEmbedding: Embedding,
+    lastToken: MLXArray,
+    lastHidden: MLXArray,
+    queryOffset: Int,
+    blockSize: Int,
+    sampler: any LogitSampler,
+    cache: [KVCache],
+    forward: (
+        _ inputsEmbeds: MLXArray, _ hiddenStates: MLXArray, _ cache: [KVCache],
+        _ positionOffset: Int
+    ) -> MLXArray
+) -> MTPDraftBlock? {
+    guard let distributionSampler = sampler as? any DistributionSampler else {
+        return nil
+    }
+    precondition(blockSize >= 2, "blockSize must be >= 2")
+
+    var tok = lastToken.ndim == 1 ? lastToken.reshaped([lastToken.dim(0), 1]) : lastToken
+    var hidden = lastHidden
+    precondition(!cache.isEmpty, "Qwen MTP drafter cache must not be empty")
+    var tokens: [MLXArray] = []
+    var distributions: [MLXArray] = []
+    tokens.reserveCapacity(blockSize - 1)
+    distributions.reserveCapacity(blockSize - 1)
+
+    for stepIndex in 0 ..< (blockSize - 1) {
+        let mtpHidden = forward(
+            inputEmbedding(tok),
+            hidden,
+            cache,
+            queryOffset + stepIndex
+        )
+        hidden = mtpHidden
+
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(mtpHidden)
+        } else {
+            logits = targetEmbedTokens.asLinear(mtpHidden)
+        }
+        let stepLogits = logits[0..., -1, 0...]
+        let next = sampler.sample(logits: stepLogits)
+        distributions.append(distributionSampler.probabilities(logits: stepLogits))
+        tok = next.ndim == 1 ? next.reshaped([next.dim(0), 1]) : next
+        tokens.append(tok)
+    }
+
+    return MTPDraftBlock(
+        tokens: concatenated(tokens, axis: 1),
+        distributions: distributions
+    )
+}
+
 package func normalizedMTPTokenBatch(_ tokens: MLXArray) -> MLXArray {
     switch tokens.ndim {
     case 1:
@@ -130,7 +186,24 @@ package func sampleMTPSeed(
     lmHead: Linear?,
     sampler: any LogitSampler
 ) -> MLXArray {
+    sampleMTPSeedWithDistribution(
+        hidden: hidden,
+        targetEmbedTokens: targetEmbedTokens,
+        lmHead: lmHead,
+        sampler: sampler
+    ).token
+}
+
+package func sampleMTPSeedWithDistribution(
+    hidden: MLXArray,
+    targetEmbedTokens: Embedding,
+    lmHead: Linear?,
+    sampler: any LogitSampler
+) -> (token: MLXArray, distribution: MLXArray?) {
     let logits = lmHead.map { $0(hidden) } ?? targetEmbedTokens.asLinear(hidden)
-    let sampled = sampler.sample(logits: logits[0..., -1, 0...])
-    return normalizedMTPColumn(sampled)
+    let stepLogits = logits[0..., -1, 0...]
+    let sampled = sampler.sample(logits: stepLogits)
+    let distribution = (sampler as? any DistributionSampler)?
+        .probabilities(logits: stepLogits)
+    return (normalizedMTPColumn(sampled), distribution)
 }

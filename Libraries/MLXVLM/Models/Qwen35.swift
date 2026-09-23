@@ -1552,7 +1552,15 @@ public class Qwen35: Module, VLMModel {
         MLXArray]
     {
         if metadata["format"]?.lowercased() == "mlx" {
-            return weights
+            var sanitized = weights
+            for (key, value) in weights
+            where key.contains("patch_embed.proj.weight")
+                && value.ndim == 5
+                && value.dim(-1) != 3
+            {
+                sanitized[key] = value.transposed(0, 2, 3, 4, 1)
+            }
+            return sanitized
         }
         return sanitize(weights: weights)
     }
@@ -1613,6 +1621,14 @@ public class Qwen35: Module, VLMModel {
 
             if key.contains("conv1d.weight") && value.dim(-1) != 1 {
                 value = value.movedAxis(source: 2, destination: 1)
+            }
+            if key.contains("patch_embed.proj.weight"),
+                value.ndim == 5,
+                value.dim(-1) != 3
+            {
+                // PyTorch stores Conv3d as [out, in, kT, kH, kW]; MLX expects
+                // [out, kT, kH, kW, in].
+                value = value.transposed(0, 2, 3, 4, 1)
             }
             if shouldShiftNormWeights
                 && normKeys.contains(where: { key.hasSuffix($0) }) && value.ndim == 1

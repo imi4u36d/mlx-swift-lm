@@ -127,9 +127,11 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             positionOffset: 0)
         state.nextPosition = shifted.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = sampleMTPSeedWithDistribution(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedDistribution = seed.distribution
         state.proposalAppended = 0
     }
 
@@ -173,6 +175,7 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
         if let seed = state.seedToken {
             let proposedCount = max(1, blockSize - 1)
             state.seedToken = nil
+            state.seedDistribution = nil
             guard proposedCount > 1, let seedHidden = state.seedHidden else {
                 state.seedHidden = nil
                 state.proposalAppended = 0
@@ -224,6 +227,94 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
         return proposed
     }
 
+    public func draftBlockWithDistributions(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)],
+        positionDeltas _: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> MTPDraftBlock? {
+        guard let distributionSampler = sampler as? any DistributionSampler else {
+            return nil
+        }
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+
+        if let seed = state.seedToken {
+            guard let seedDistribution = state.seedDistribution else {
+                return nil
+            }
+            let proposedCount = max(1, blockSize - 1)
+            let seedColumn = normalizedMTPColumn(seed)
+            guard proposedCount > 1, let seedHidden = state.seedHidden else {
+                state.seedToken = nil
+                state.seedHidden = nil
+                state.seedDistribution = nil
+                state.proposalAppended = 0
+                return MTPDraftBlock(
+                    tokens: seedColumn,
+                    distributions: [seedDistribution]
+                )
+            }
+
+            var tokens = [seedColumn]
+            var distributions = [seedDistribution]
+            var token = seed
+            var hidden = seedHidden
+            let appended = proposedCount - 1
+            for step in 0 ..< appended {
+                let mtpHidden = mtp(
+                    inputsEmbeds: inputEmbedding(token),
+                    hiddenStates: hidden,
+                    cache: state.cache,
+                    positionOffset: queryOffset + step)
+                hidden = mtpHidden
+                let logits = lmHead.map { $0(mtpHidden) }
+                    ?? targetEmbedTokens.asLinear(mtpHidden)
+                let stepLogits = logits[0..., -1, 0...]
+                token = normalizedMTPColumn(sampler.sample(logits: stepLogits))
+                tokens.append(token)
+                distributions.append(
+                    distributionSampler.probabilities(logits: stepLogits))
+            }
+            state.seedToken = nil
+            state.seedHidden = nil
+            state.seedDistribution = nil
+            state.proposalAppended = appended
+            state.nextPosition += appended
+            return MTPDraftBlock(
+                tokens: concatenated(tokens, axis: 1),
+                distributions: distributions
+            )
+        }
+
+        let proposed = draftMTPTokenBlockWithDistributions(
+            targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead,
+            inputEmbedding: inputEmbedding,
+            lastToken: lastToken,
+            lastHidden: lastHidden,
+            queryOffset: queryOffset,
+            blockSize: blockSize,
+            sampler: sampler,
+            cache: state.cache
+        ) { inputsEmbeds, hiddenStates, cache, positionOffset in
+            mtp(
+                inputsEmbeds: inputsEmbeds,
+                hiddenStates: hiddenStates,
+                cache: cache,
+                positionOffset: positionOffset)
+        }
+        guard let proposed else { return nil }
+        state.proposalAppended = blockSize - 1
+        state.nextPosition += state.proposalAppended
+        return proposed
+    }
+
     public func commitDrafterState(
         target: any LanguageModel,
         targetHidden: MLXArray,
@@ -261,9 +352,11 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             positionOffset: state.nextPosition)
         state.nextPosition += committedTokens.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = sampleMTPSeedWithDistribution(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedDistribution = seed.distribution
         state.proposalAppended = 0
     }
 
