@@ -54,7 +54,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// Total tokens proposed per round (`blockSize - 1` drafted, plus the
     /// bonus token from the previous verify). Mirrors mlx-vlm's
     /// `draft_block_size` parameter.
-    public let blockSize: Int
+    public private(set) var blockSize: Int
+    private let maximumAdaptiveBlockSize: Int
 
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
@@ -147,6 +148,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let effectiveBlockSize = Swift.min(
             drafterBlockSize, Self.maximumBlockSize(for: mainCache))
         self.blockSize = effectiveBlockSize
+        self.maximumAdaptiveBlockSize = effectiveBlockSize
 
         // Probe by opening a round at the width rounds will actually use and discarding it,
         // rather than duplicating the leaf classification as a predicate that could drift from
@@ -648,6 +650,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             targetVerified: numDraft + 1,
             draftModelCalls: 1
         )
+        updateAdaptiveBlockSize(drafted: numDraft, accepted: accepted)
 
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
@@ -731,6 +734,20 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         kvCachePlan.apply(to: mainCacheStorage)
 
         y = .init(tokens: emittedFinalToken)
+    }
+
+    /// Keep the draft width near the point where verification pays for
+    /// itself. A high block is worthwhile when all or most drafts survive;
+    /// otherwise the verifier is doing nearly as much work as plain decode.
+    private mutating func updateAdaptiveBlockSize(drafted: Int, accepted: Int) {
+        guard drafted > 0 else { return }
+        if accepted == drafted, blockSize < maximumAdaptiveBlockSize {
+            blockSize += 1
+            return
+        }
+        if accepted * 100 < drafted * 45, blockSize > 2 {
+            blockSize -= 1
+        }
     }
 
     /// Trim every append-only attention leaf by the rejected tail. Recurrent
